@@ -17,7 +17,6 @@ depends=(
   libarchive
   binutils
   tar
-  rpm-tools
 )
 makedepends=(
 )
