@@ -31,6 +31,8 @@ To run this widget on Arch Linux, ensure you have the following dependencies ins
 sudo pacman -S python gtk4 libadwaita python-gobject binutils tar libarchive pacman rpm-tools xdg-utils linexin-center
 ```
 
+You will also need [Linexin Center](https://github.com/Petexy/Linexin-Center) from [linexin-repo](https://github.com/Petexy/linexin-repo/tree/main/x86_64).
+
 ## 🌐 Supported Languages
 
 Linpaco is available in:
