@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+
+import gi
+import os
+import shutil
+import tempfile
+import subprocess
+import threading
+import re
+from pathlib import Path
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Gtk, Adw, GLib, Gio, GObject, Gdk
+
+# Import localization
+# Import localization
+import locale
+import importlib.util
+
+def load_translations():
+    try:
+        lang = locale.getdefaultlocale()[0]
+        if not lang:
+            lang = "en_US"
+            
+        # Path to localization file
+        # Assumes structure: .../widgets/localization/{lang}/package_converter_dictionary.py
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        loc_file = os.path.join(base_dir, "localization", lang, "package_converter_dictionary.py")
+        
+        if not os.path.exists(loc_file):
+            # Fallback to en_US if specific lang not found
+            loc_file = os.path.join(base_dir, "localization", "en_US", "package_converter_dictionary.py")
+            
+        if os.path.exists(loc_file):
+            spec = importlib.util.spec_from_file_location("package_converter_dictionary", loc_file)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            if hasattr(module, "translations"):
+                return module.translations
+    except Exception as e:
+        print(f"Failed to load translations: {e}")
+        
+    return {}
+
+_translations = load_translations()
+
+def _(msg):
+    return _translations.get(msg, msg)
+
+class PackageConverterWidget(Gtk.Box):
+    def __init__(self, hide_sidebar=False, window=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        
+        self.widgetname = "Package Converter"
+        self.widgeticon = "/usr/share/icons/linpaco.svg"
+        
+        self.window = window
+        self.hide_sidebar = hide_sidebar
+        self.selected_file = None
+        self.is_converting = False
+        
+        # Setup UI
+        self.set_margin_top(12)
+        self.set_margin_bottom(50)
+        self.set_margin_start(50)
+        self.set_margin_end(50)
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # Header
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header_box.set_margin_bottom(20)
+        
+        icon = Gtk.Image.new_from_file("/usr/share/icons/linpaco.svg")
+        icon.set_pixel_size(48)
+        header_box.append(icon)
+        
+        title_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        title_label = Gtk.Label(label=_("Package Converter"))
+        title_label.add_css_class("title-2")
+        title_label.set_halign(Gtk.Align.START)
+        title_box.append(title_label)
+        
+        desc_label = Gtk.Label(label=_("Convert .deb/.rpm to Arch Linux Package"))
+        desc_label.add_css_class("dim-label")
+        desc_label.set_halign(Gtk.Align.START)
+        title_box.append(desc_label)
+        
+        header_box.append(title_box)
+        
+        # Spacer for header to push toggle button to right
+        h_spacer = Gtk.Box()
+        h_spacer.set_hexpand(True)
+        header_box.append(h_spacer)
+        
+        # Toggle Log Button (Top Right)
+        self.btn_toggle_log = Gtk.Button()
+        self.btn_toggle_log.set_icon_name("pan-end-symbolic-rtl") # Arrow pointing right (default)
+        self.btn_toggle_log.set_tooltip_text(_("Show/Hide Log"))
+        self.btn_toggle_log.connect("clicked", self.on_toggle_log_clicked)
+        self.btn_toggle_log.add_css_class("flat")
+        self.btn_toggle_log.set_valign(Gtk.Align.CENTER)
+        header_box.append(self.btn_toggle_log)
+        
+        self.append(header_box)
+        
+        # Main Content Area (Horizontal split)
+        main_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        main_box.set_homogeneous(False)
+        main_box.set_vexpand(True) # Expand to fill vertical space
+        
+        # Left Panel - Controls
+        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+        left_box.set_hexpand(True) # Take up remaining space
+        
+        # File Selection Area (Drop Zone)
+        self.drop_zone = Gtk.Button()
+        self.drop_zone.add_css_class("card")
+        self.drop_zone.set_size_request(-1, 150)
+        self.drop_zone.connect("clicked", self.on_select_file_clicked)
+        
+        # Enable Drag & Drop
+        drop_target = Gtk.DropTarget(actions=Gdk.DragAction.COPY)
+        drop_target.set_gtypes([Gio.File])
+        drop_target.connect("drop", self.on_file_drop)
+        self.drop_zone.add_controller(drop_target)
+        
+        drop_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        drop_box.set_valign(Gtk.Align.CENTER)
+        drop_box.set_halign(Gtk.Align.CENTER)
+        
+        dz_icon = Gtk.Image.new_from_icon_name("folder-open-symbolic")
+        dz_icon.set_pixel_size(48)
+        drop_box.append(dz_icon)
+        
+        self.file_label = Gtk.Label(label=_("Select Package File"))
+        self.file_label.add_css_class("title-4")
+        self.file_label.set_ellipsize(3) # Pango.EllipsizeMode.END
+        drop_box.append(self.file_label)
+        
+        dz_hint = Gtk.Label(label=_("Or Drag & Drop file here"))
+        dz_hint.add_css_class("dim-label")
+        drop_box.append(dz_hint)
+        
+        self.drop_zone.set_child(drop_box)
+        left_box.append(self.drop_zone)
+        
+        # Options
+        options_grp = Adw.PreferencesGroup()
+        options_grp.set_title(_("Conversion Options"))
+        
+        self.opt_install = Adw.ActionRow()
+        self.opt_install.set_title(_("Install after conversion"))
+        self.switch_install = Gtk.Switch()
+        self.switch_install.set_valign(Gtk.Align.CENTER)
+        self.switch_install.set_active(True) # Default to True
+        self.opt_install.add_suffix(self.switch_install)
+        options_grp.add(self.opt_install)
+        
+        self.opt_deps = Adw.ActionRow()
+        self.opt_deps.set_title(_("Ignore strict dependency checks"))
+        self.opt_deps.set_subtitle(_("May result in broken packages if dependencies are missing"))
+        self.opt_deps.set_title_lines(2)
+        self.switch_deps = Gtk.Switch()
+        self.switch_deps.set_valign(Gtk.Align.CENTER)
+        self.switch_deps.set_active(True) # Default to true for dumb conversion
+        self.opt_deps.add_suffix(self.switch_deps)
+        options_grp.add(self.opt_deps)
+        
+        left_box.append(options_grp)
+        main_box.append(left_box)
+        
+        # Right Panel - Log Output (Collapsible)
+        self.log_revealer = Gtk.Revealer()
+        self.log_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        self.log_revealer.set_reveal_child(False) # Hidden by default
+        
+        right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        right_box.set_size_request(350, -1) # Fixed width
+        
+        log_label = Gtk.Label(label=_("Conversion Log"))
+        log_label.add_css_class("heading")
+        log_label.set_halign(Gtk.Align.START)
+        right_box.append(log_label)
+        
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_vexpand(True)
+        log_scroll.add_css_class("card")
+        
+        self.log_buffer = Gtk.TextBuffer()
+        self.log_view = Gtk.TextView.new_with_buffer(self.log_buffer)
+        self.log_view.set_editable(False)
+        self.log_view.set_monospace(True)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_view.set_bottom_margin(10)
+        self.log_view.set_top_margin(10)
+        self.log_view.set_left_margin(10)
+        self.log_view.set_right_margin(10)
+        
+        log_scroll.set_child(self.log_view)
+        right_box.append(log_scroll)
+        
+        self.log_revealer.set_child(right_box)
+        main_box.append(self.log_revealer)
+        
+        self.append(main_box)
+        
+        # Bottom Action Bar
+        bottom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        bottom_box.set_margin_top(10)
+        
+        # Spacer for bottom box
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        bottom_box.append(spacer)
+        
+        # Convert Button (Right)
+        self.convert_btn = Gtk.Button(label=_("Convert"))
+        self.convert_btn.add_css_class("suggested-action")
+        self.convert_btn.add_css_class("buttons_all")
+        self.convert_btn.set_sensitive(False)
+        self.convert_btn.connect("clicked", self.on_convert_clicked)
+        # HAlign is handled by spacer + appending at end
+        bottom_box.append(self.convert_btn)
+        
+        self.append(bottom_box)
+        
+        # Tags for log
+        self.log_buffer.create_tag("error", foreground="red")
+        self.log_buffer.create_tag("success", foreground="green")
+        self.log_buffer.create_tag("info", foreground="blue")
+
+    def on_select_file_clicked(self, button):
+        self.file_chooser = Gtk.FileDialog(title=_("Select Package File"))
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("Package Files (*.deb, *.rpm)")
+        all_filter.add_pattern("*.deb")
+        all_filter.add_pattern("*.rpm")
+        filters.append(all_filter)
+        
+        deb_filter = Gtk.FileFilter()
+        deb_filter.set_name("Debian Package (*.deb)")
+        deb_filter.add_pattern("*.deb")
+        filters.append(deb_filter)
+        
+        rpm_filter = Gtk.FileFilter()
+        rpm_filter.set_name("RPM Package (*.rpm)")
+        rpm_filter.add_pattern("*.rpm")
+        filters.append(rpm_filter)
+        
+        self.file_chooser.set_filters(filters)
+        self.file_chooser.open(self.window, None, self.on_file_selected)
+
+    def on_file_selected(self, source, result):
+        try:
+            f = source.open_finish(result)
+            self.set_selected_file(f.get_path())
+        except Exception as e:
+            print(f"Error selecting file: {e}")
+
+    def on_file_drop(self, target, value, x, y):
+        if value:
+            self.set_selected_file(value.get_path())
+            return True
+        return False
+
+    def set_selected_file(self, path):
+        if path and (path.endswith(".deb") or path.endswith(".rpm")):
+            self.selected_file = path
+            filename = os.path.basename(path)
+            self.file_label.set_text(filename)
+            self.convert_btn.set_sensitive(True)
+            self.log_message(f"Selected file: {path}", "info")
+        else:
+            self.log_message(_("Invalid file extension"), "error")
+
+    def log_message(self, message, tag=None):
+        end_iter = self.log_buffer.get_end_iter()
+        if tag:
+            self.log_buffer.insert_with_tags_by_name(end_iter, message + "\n", tag)
+        else:
+            self.log_buffer.insert(end_iter, message + "\n")
+        
+        # Scroll to bottom
+        adj = self.log_view.get_parent().get_vadjustment()
+        GLib.idle_add(lambda: adj.set_value(adj.get_upper() - adj.get_page_size()))
+
+    def on_convert_clicked(self, button):
+        if not self.selected_file:
+            return
+        
+        if self.is_converting:
+            return
+            
+        self.is_converting = True
+        self.convert_btn.set_sensitive(False)
+        self.drop_zone.set_sensitive(False)
+        self.switch_deps.set_sensitive(False)
+        self.switch_install.set_sensitive(False)
+        
+        # Auto-expand log
+        self.log_revealer.set_reveal_child(True)
+        self.btn_toggle_log.set_icon_name("pan-start-symbolic-rtl") # Expanded -> show arrow to close (Left)
+        
+        self.log_buffer.set_text("")
+        self.log_message(_("Starting conversion..."), "info")
+        
+        threading.Thread(target=self.run_conversion, daemon=True).start()
+
+    def on_toggle_log_clicked(self, button):
+        is_revealed = self.log_revealer.get_reveal_child()
+        self.log_revealer.set_reveal_child(not is_revealed)
+        
+        # Logic: 
+        # Clicked when Closed (is_revealed=False) -> Opens -> Show Left Arrow (to close)
+        # Clicked when Open (is_revealed=True) -> Closes -> Show Right Arrow (to open)
+        
+        if not is_revealed: # Opening
+            self.btn_toggle_log.set_icon_name("pan-start-symbolic-rtl")
+        else: # Closing
+             self.btn_toggle_log.set_icon_name("pan-end-symbolic-rtl")
+
+    def run_conversion(self):
+        try:
+            pkg_path = os.path.abspath(self.selected_file)
+            pkg_type = "deb" if pkg_path.endswith(".deb") else "rpm"
+            output_dir = os.path.dirname(pkg_path)
+            
+            with tempfile.TemporaryDirectory() as temp_dir:
+                work_dir = Path(temp_dir)
+                
+                GLib.idle_add(self.log_message, _("Extracting package info..."))
+                
+                pkgname = "unknown"
+                pkgver = "0.0.1"
+                pkgrel = "1"
+                pkgdesc = "Converted package"
+                arch = "any"
+                
+                if pkg_type == "deb":
+                    # Use ar to extract control.tar.*
+                    cmd_ar = ["ar", "x", pkg_path]
+                    res = subprocess.run(cmd_ar, cwd=work_dir, capture_output=True, text=True)
+                    if res.returncode != 0:
+                        raise Exception(f"Failed to unpack deb: {res.stderr}")
+                    
+                    control_archive = list(work_dir.glob("control.tar*"))
+                    if not control_archive:
+                        raise Exception("No control.tar.* found in deb archive")
+                    
+                    control_archive = control_archive[0]
+                    
+                    # Extract ALL files from control archive (don't specify 'control' explicitly to avoid path issues)
+                    cmd_tar = ["tar", "xf", str(control_archive)]
+                    res = subprocess.run(cmd_tar, cwd=work_dir, capture_output=True, text=True)
+                    if res.returncode != 0:
+                        raise Exception(f"Failed to extract control archive: {res.stderr}")
+                    
+                    # Find control file (could be ./control or control)
+                    control_file = None
+                    if (work_dir / "control").exists():
+                        control_file = work_dir / "control"
+                    elif (work_dir / "./control").exists():
+                        control_file = work_dir / "./control"
+                    
+                    if not control_file:
+                         raise Exception("control file not found after extraction")
+                    
+                    # Parse control file
+                    metadata = {}
+                    with open(control_file, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        current_key = None
+                        for line in content.splitlines():
+                            if not line: continue
+                            if line.startswith(" "):
+                                if current_key:
+                                    metadata[current_key] += "\n" + line.strip()
+                            elif ":" in line:
+                                key, val = line.split(":", 1)
+                                current_key = key.strip()
+                                metadata[current_key] = val.strip()
+
+                    pkgname = metadata.get("Package", pkgname).lower()
+                    pkgver_full = metadata.get("Version", pkgver)
+                    desc_raw = metadata.get("Description", pkgdesc)
+                    pkgdesc = desc_raw.split("\n")[0]
+                    architecture = metadata.get("Architecture", arch)
+                    
+                    if "-" in pkgver_full:
+                        pv = pkgver_full.split("-")
+                        pkgver = pv[0]
+                        pkgrel = pv[1]
+                    else:
+                        pkgver = pkgver_full
+                        
+                    # Map Arch
+                    arch_map = {"amd64": "x86_64", "arm64": "aarch64", "all": "any"}
+                    arch = arch_map.get(architecture, architecture)
+
+                else: # RPM
+                    rpm_cmd_available = shutil.which("rpm") is not None
+                    
+                    found_metadata = False
+                    if rpm_cmd_available:
+                        # Extract metadata using rpm query
+                        res = subprocess.run(
+                            ["rpm", "-qp", "--queryformat", "%{NAME}|%{VERSION}|%{RELEASE}|%{SUMMARY}|%{ARCH}", pkg_path],
+                            capture_output=True, text=True
+                        )
+                        if res.returncode == 0:
+                            parts = res.stdout.split("|")
+                            if len(parts) >= 5:
+                                pkgname = parts[0].lower()
+                                pkgver = parts[1]
+                                pkgrel = parts[2]
+                                pkgdesc = parts[3]
+                                arch_rpm = parts[4]
+                                
+                                arch_map = {"x86_64": "x86_64", "noarch": "any", "aarch64": "aarch64"}
+                                arch = arch_map.get(arch_rpm, arch_rpm)
+                                found_metadata = True
+                        else:
+                             GLib.idle_add(self.log_message, f"Warning: rpm command failed: {res.stderr}", "error")
+                    
+                    if not found_metadata:
+                        # Fallback parsing for weird filenames like google-chrome-stable_current_x86_64.rpm
+                        fname = os.path.basename(pkg_path)
+                        if fname.lower().endswith(".rpm"):
+                            fname = fname[:-4]
+                            
+                        GLib.idle_add(self.log_message, _("Warning: Metadata parsed from filename, may be inaccurate."), "info")
+                        
+                        # Heuristic: separators are usually -, _, .
+                        # Typical RPM: name-version-release.arch
+                        # Typical Deb-style RPM: name_version_arch
+                        
+                        arch_map = {"x86_64": "x86_64", "noarch": "any", "amd64": "x86_64"}
+                        
+                        # Try to detect architecture at the end
+                        arch = "any"
+                        for a_key, a_val in arch_map.items():
+                             if fname.endswith(a_key):
+                                 arch = a_val
+                                 fname = fname[:-len(a_key)].strip("-_.")
+                                 break
+                        
+                        # Splitting Name vs Version
+                        # Try to find the first digit
+                        match = re.search(r"\d", fname)
+                        if match:
+                            idx = match.start()
+                            # If digit is at start, logic fails, but unexpected for package names
+                            if idx > 0:
+                                pkgname = fname[:idx].strip("-_.")
+                                ver_part = fname[idx:].strip("-_.")
+                                
+                                # Split ver_part into ver and rel
+                                # Try splitting by - or _
+                                if "-" in ver_part:
+                                    parts = ver_part.split("-")
+                                    pkgver = parts[0]
+                                    if len(parts) > 1:
+                                        pkgrel = parts[1]
+                                elif "_" in ver_part:
+                                    parts = ver_part.split("_")
+                                    pkgver = parts[0]
+                                    if len(parts) > 1:
+                                        pkgrel = parts[1]
+                                else:
+                                    pkgver = ver_part
+                            else:
+                                pkgname = fname # No version found/starts with digit?
+                        else:
+                            pkgname = fname
+                        
+                # --- Sanitization ---
+                # Ensure pkgname is lowercase and valid chars
+                pkgname = re.sub(r"[^a-z0-9@._+-]", "", pkgname.lower())
+                
+                # Ensure pkgver is valid
+                pkgver = re.sub(r"[^a-zA-Z0-9._+]", "_", pkgver)
+                if not pkgver: pkgver = "0.0.1"
+                
+                # Ensure pkgrel is integer-like
+                # Arch pkgrel must be just a number or number.number
+                # If we have something like 'current', force it to '1'
+                if not re.match(r"^[0-9]+(\.[0-9]+)?$", pkgrel):
+                     GLib.idle_add(self.log_message, f"Warning: Invalid pkgrel '{pkgrel}', defaulting to '1'.", "info")
+                     pkgrel = "1"
+                     
+                GLib.idle_add(self.log_message, f"Package: {pkgname}\nVersion: {pkgver}-{pkgrel}\nArch: {arch}", "info")
+                
+                # 2. Create PKGBUILD
+                pkgbuild_content = f"""
+# Auto-generated by Linexin Package Converter
+pkgname="{pkgname}-bin"
+pkgver="{pkgver}"
+pkgrel="{pkgrel}"
+pkgdesc="{pkgdesc}"
+arch=('{arch}')
+url="http://localhost"
+license=('custom')
+depends=() # Dependencies ignored
+source=("local://{os.path.basename(pkg_path)}")
+md5sums=('SKIP')
+
+package() {{
+    # Extract package content
+    # bsdtar can handle both .deb (ar+tar) and .rpm (cpio) extraction via libarchive
+    # For .deb, we extracted 'data.tar' manually before, but makepkg handles sources nicely mostly,
+    # except we need to handle the specific extraction logic.
+    
+    cd "$pkgdir"
+    
+    if [[ "{pkg_type}" == "deb" ]]; then
+        bsdtar -O -xf "$srcdir/{os.path.basename(pkg_path)}" data.tar* | bsdtar -xf -
+    elif [[ "{pkg_type}" == "rpm" ]]; then
+        bsdtar -xf "$srcdir/{os.path.basename(pkg_path)}"
+        # RPMs might extract to a subdirectory or root, bsdtar usually extracts to CWD
+    fi
+    
+    # Check for 'usr' directory creation to verify extraction
+    # Some RPMs might be messy
+    
+    # Fix permissions
+    find . -type d -exec chmod 755 {{}} +
+}}
+"""
+                
+                GLib.idle_add(self.log_message, _("Generating PKGBUILD..."))
+                with open(work_dir / "PKGBUILD", "w") as f:
+                    f.write(pkgbuild_content)
+                
+                # Copy package to work_dir
+                shutil.copy(pkg_path, work_dir)
+                
+                # 3. Run makepkg
+                GLib.idle_add(self.log_message, _("Running makepkg..."))
+                
+                env = os.environ.copy()
+                env["PKGDEST"] = output_dir 
+                
+                cmd_makepkg = ["makepkg", "-f", "--noconfirm"]
+                
+                process = subprocess.Popen(
+                    cmd_makepkg,
+                    cwd=work_dir,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                
+                while True:
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line:
+                        GLib.idle_add(self.log_message, line.strip())
+                
+                if process.returncode == 0:
+                    GLib.idle_add(self.log_message, _("Conversion successful!"), "success")
+                    GLib.idle_add(self.on_conversion_finished, True)
+                    
+                    if self.switch_install.get_active():
+                        GLib.idle_add(self.install_package, pkgname, output_dir)
+                else:
+                    GLib.idle_add(self.log_message, _("Conversion failed during packaging."), "error")
+                    GLib.idle_add(self.on_conversion_finished, False)
+                    
+        except Exception as e:
+            GLib.idle_add(self.log_message, f"Error: {e}", "error")
+            import traceback
+            traceback.print_exc()
+            GLib.idle_add(self.on_conversion_finished, False)
+
+    def on_conversion_finished(self, success):
+        self.is_converting = False
+        self.convert_btn.set_sensitive(True)
+        self.drop_zone.set_sensitive(True)
+        self.switch_deps.set_sensitive(True)
+        self.switch_install.set_sensitive(True)
+        
+        if success:
+             self.show_toast(_("Package created successfully!"))
+    
+    def install_package(self, pkgname, output_dir):
+        self.log_message(_("Installing package..."), "info")
+        try:
+            files = list(Path(output_dir).glob("*.pkg.tar.zst"))
+            if not files:
+                 self.log_message(_("Could not find package file to install."), "error")
+                 return
+                 
+            latest_pkg = max(files, key=os.path.getmtime)
+            
+            self.log_message(f"Launching installer for {latest_pkg.name}...")
+            subprocess.Popen(["xdg-open", str(latest_pkg)])
+            
+        except Exception as e:
+             self.log_message(f"Failed to launch installer: {e}", "error")
+
+    def show_toast(self, message):
+        toast = Adw.Toast.new(message)
+        if self.window:
+            root = self.window.get_content()
+            if hasattr(root, "add_toast"):
+                 root.add_toast(toast)
