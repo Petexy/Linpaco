@@ -7,6 +7,7 @@ import tempfile
 import subprocess
 import threading
 import re
+import atexit
 from pathlib import Path
 
 gi.require_version("Gtk", "4.0")
@@ -60,6 +61,16 @@ class PackageConverterWidget(Gtk.Box):
         self.hide_sidebar = hide_sidebar
         self.selected_file = None
         self.is_converting = False
+        
+        # Sudo wrapper state
+        self.user_password = None
+        self._askpass_tf = tempfile.NamedTemporaryFile(delete=False, prefix="linpaco-askpass-")
+        self.askpass_script = self._askpass_tf.name
+        self._askpass_tf.close()
+        self._sudo_tf = tempfile.NamedTemporaryFile(delete=False, prefix="linpaco-sudo-")
+        self.sudo_wrapper = self._sudo_tf.name
+        self._sudo_tf.close()
+        atexit.register(self.cleanup_temp_files)
         
         # Setup UI
         self.set_margin_top(12)
@@ -232,6 +243,98 @@ class PackageConverterWidget(Gtk.Box):
         self.log_buffer.create_tag("error", foreground="red")
         self.log_buffer.create_tag("success", foreground="green")
         self.log_buffer.create_tag("info", foreground="blue")
+
+    def clear_credentials(self):
+        """Clear stored password and sudo timestamp"""
+        self.user_password = None
+        try:
+            subprocess.run(['sudo', '-k'], check=False)
+        except:
+            pass
+
+    def cleanup_temp_files(self):
+        self.clear_credentials()
+        try:
+            if os.path.exists(self.askpass_script):
+                os.remove(self.askpass_script)
+            if os.path.exists(self.sudo_wrapper):
+                os.remove(self.sudo_wrapper)
+        except:
+            pass
+
+    def setup_sudo_env(self):
+        """Create helper scripts for non-interactive sudo"""
+        with open(self.askpass_script, "w") as f:
+            f.write("#!/bin/sh\necho \"$LINEXIN_SUDO_PW\"\n")
+        os.chmod(self.askpass_script, 0o700)
+        
+        with open(self.sudo_wrapper, "w") as f:
+            f.write(f"#!/bin/sh\nexport SUDO_ASKPASS='{self.askpass_script}'\nexec sudo -A \"$@\"\n")
+        os.chmod(self.sudo_wrapper, 0o700)
+
+    def prompt_for_password(self, callback_arg1, callback_arg2):
+        """Prompt user for sudo password using Adw.MessageDialog"""
+        root = self.window
+            
+        dialog = Adw.MessageDialog(
+            heading=_("Authentication Required"),
+            body=_("Please enter your password to proceed with the installation."),
+            transient_for=root
+        )
+        
+        dialog.add_response("cancel", _("Cancel"))
+        dialog.add_response("unlock", _("Unlock"))
+        dialog.set_response_appearance("unlock", Adw.ResponseAppearance.SUGGESTED)
+        
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        
+        entry = Gtk.PasswordEntry()
+        entry.set_property("placeholder-text", _("Password"))
+        box.append(entry)
+        
+        dialog.set_extra_child(box)
+        
+        def on_response(dialog, response):
+            if response == "unlock":
+                pwd = entry.get_text()
+                if pwd:
+                    self.user_password = pwd
+                    # Resume installation flow
+                    self.install_package(callback_arg1, callback_arg2)
+            dialog.close()
+            
+        dialog.connect("response", on_response)
+        
+        def on_entry_activate(widget):
+            dialog.response("unlock")
+            
+        entry.connect("activate", on_entry_activate)
+        
+        dialog.present()
+
+    def validate_password(self):
+        """Validate the sudo password using sudo -S"""
+        if not self.user_password:
+            return False
+            
+        try:
+            subprocess.run(['sudo', '-k'], check=False)
+            
+            result = subprocess.run(
+                ['sudo', '-S', '-v'],
+                input=(self.user_password + '\n'),
+                capture_output=True,
+                text=True,
+                env={'LC_ALL': 'C'}
+            )
+            
+            if result.returncode == 0:
+                return True
+            else:
+                return False
+        except Exception as e:
+            print(f"Validation exception: {e}")
+            return False
 
     def on_select_file_clicked(self, button):
         self.file_chooser = Gtk.FileDialog(title=_("Select Package File"))
@@ -592,20 +695,92 @@ package() {{
              self.show_toast(_("Package created successfully!"))
     
     def install_package(self, pkgname, output_dir):
+        # 1. Check for password
+        if not self.user_password:
+            self.prompt_for_password(pkgname, output_dir)
+            return
+        
+        # 2. Validate password
+        self.setup_sudo_env()
+        if not self.validate_password():
+            self.clear_credentials() # Clear invalid/entered password
+            
+            dialog = Adw.MessageDialog(
+                heading=_("Authentication Failed"),
+                body=_("The password you entered is incorrect. Please try again."),
+                transient_for=self.window
+            )
+            dialog.add_response("ok", _("OK"))
+            dialog.set_response_appearance("ok", Adw.ResponseAppearance.DEFAULT)
+            dialog.connect("response", lambda d, r: d.close())
+            dialog.present()
+            self.log_message(_("Authentication failed."), "error")
+            return
+
         self.log_message(_("Installing package..."), "info")
         try:
             files = list(Path(output_dir).glob("*.pkg.tar.zst"))
+            
+            # Filter out debug packages
+            # The package name is generated as "{pkgname}-bin"
+            # Debug packages are named "{pkgname}-bin-debug-{version}-{arch}..."
+            # So we filter out files starting with "{pkgname}-bin-debug-"
+            debug_prefix = f"{pkgname}-bin-debug-"
+            
+            files = [f for f in files if not f.name.startswith(debug_prefix)]
+            
             if not files:
                  self.log_message(_("Could not find package file to install."), "error")
                  return
                  
             latest_pkg = max(files, key=os.path.getmtime)
+            pkg_path = str(latest_pkg)
             
-            self.log_message(f"Launching installer for {latest_pkg.name}...")
-            subprocess.Popen(["xdg-open", str(latest_pkg)])
+            self.log_message(f"Installing {latest_pkg.name}...")
+            
+            # Use sudo wrapper to install
+            # Run installation in a thread to not block UI
+            threading.Thread(target=self.run_install_command, args=(pkg_path,), daemon=True).start()
             
         except Exception as e:
              self.log_message(f"Failed to launch installer: {e}", "error")
+
+    def run_install_command(self, pkg_path):
+        try:
+            env = os.environ.copy()
+            if self.user_password:
+                env['LINEXIN_SUDO_PW'] = self.user_password
+            
+            # Using -U --noconfirm for non-interactive install
+            cmd = f"{self.sudo_wrapper} pacman -U --noconfirm '{pkg_path}'"
+            
+            process = subprocess.Popen(
+                cmd,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=env
+            )
+            
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    GLib.idle_add(self.log_message, line.strip())
+            
+            if process.returncode == 0:
+                GLib.idle_add(self.log_message, _("Installation successful!"), "success")
+                GLib.idle_add(self.show_toast, _("Package installed successfully!"))
+            else:
+                 GLib.idle_add(self.log_message, _("Installation failed."), "error")
+                 
+        except Exception as e:
+            GLib.idle_add(self.log_message, f"Installation error: {e}", "error")
+        finally:
+            # security: clear credentials after installation attempt
+            self.clear_credentials()
 
     def show_toast(self, message):
         toast = Adw.Toast.new(message)

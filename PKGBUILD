@@ -1,7 +1,7 @@
 # Maintainer: Petexy <https://github.com/Petexy>
 
 pkgname=linpaco
-pkgver=1.0.0.r
+pkgver=1.0.1.r
 pkgrel=1
 _currentdate=$(date +"%Y-%m-%d%H-%M-%S")
 pkgdesc="Linexin's Package Converter Tool for .deb and .rpm files"
