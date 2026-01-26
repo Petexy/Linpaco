@@ -510,6 +510,8 @@ package() {{
         except Exception as e:
              self.log_message(f"Failed to launch installer: {e}", "error")
     def run_install_command(self, pkg_path):
+        if sudo_manager:
+            sudo_manager.start_privileged_session()
         try:
             env = sudo_manager.get_env()
             cmd = f"{sudo_manager.wrapper_path} pacman -U --noconfirm '{pkg_path}'"
@@ -535,6 +537,8 @@ package() {{
         except Exception as e:
             GLib.idle_add(self.log_message, f"Installation error: {e}", "error")
         finally:
+            if sudo_manager:
+                sudo_manager.stop_privileged_session()
             self.clear_credentials()
     def show_toast(self, message):
         toast = Adw.Toast.new(message)
