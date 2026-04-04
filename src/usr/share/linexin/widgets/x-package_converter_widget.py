@@ -203,12 +203,14 @@ class PackageConverterWidget(Gtk.Box):
                             transient_for=self.window
                         )
                         err_dlg.add_response("ok", _("OK"))
+                        translate_dialog(err_dlg)
                         err_dlg.present()
             dialog.close()
         dialog.connect("response", on_response)
         def on_entry_activate(widget):
             dialog.response("unlock")
         entry.connect("activate", on_entry_activate)
+        translate_dialog(dialog)
         dialog.present()
     def validate_password(self):
         """Validate the sudo password using sudo -S"""
@@ -492,6 +494,7 @@ package() {{
             dialog.add_response("ok", _("OK"))
             dialog.set_response_appearance("ok", Adw.ResponseAppearance.DEFAULT)
             dialog.connect("response", lambda d, r: d.close())
+            translate_dialog(dialog)
             dialog.present()
             self.log_message(_("Authentication failed."), "error")
             return
